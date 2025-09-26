@@ -1,9 +1,11 @@
 import cv2 as cv
-import numpy as np 
-import matplotlib.pyplot as plt
-import math 
+import numpy as np
+import math
+from AR import AugmentedRealityHandler
+from Panorama import PanoramaHandler
+from Camera_calibration import calibrate_camera
 
-
+# ----------------------- Utility Functions -----------------------
 def click_event(event, x, y, flags, param):
     if event == cv.EVENT_LBUTTONDOWN:
         print(f'Clicked at: ({x},{y})')
@@ -11,229 +13,214 @@ def click_event(event, x, y, flags, param):
 def nothing(x):
     pass
 
-cap = cv.VideoCapture(0)
-if not cap.isOpened():
-    print('Camera cannot be opened.')
-    exit()
+def create_trackbar(frame_name, name, default, max_val):
+    cv.createTrackbar(name, frame_name, default, max_val, nothing)
 
-mode = 'n' #default normal
-frame_name = 'Camera Color Scale'
-lines = [
-    '[N] Normal, [G] GrayScale, [H] HSV,',
-    '[C] Contrast/Brightness, [I] Histogram,',
-    '[B] Gaussian Blur, [F] Bilateral Filter',
-    '[E] Canny Edge Detection, [L] Hough Line Detection',
-    '[Q] Quit Camera'
-    ] 
+def reset_window(frame_name):
+    """Destroy and recreate window to clear trackbars."""
+    cv.destroyWindow(frame_name)
+    cv.namedWindow(frame_name)
+    cv.setMouseCallback(frame_name, click_event)
 
-cv.namedWindow(frame_name)
-cv.setMouseCallback(frame_name, click_event)
+# ----------------------- Filters / Transformations -----------------------
+def apply_grayscale(frame):
+    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+    return cv.cvtColor(gray, cv.COLOR_GRAY2BGR)
 
+def apply_hsv(frame):
+    return cv.cvtColor(frame, cv.COLOR_BGR2HSV)
 
-# Brightness and Contrast Trackbar
-BC_Tracker = False
-trackBarBCCreated = False
+def adjust_brightness_contrast(frame, frame_name):
+    brightness = cv.getTrackbarPos('Brightness', frame_name) - 255
+    contrast = cv.getTrackbarPos('Contrast', frame_name) / 10.0
+    return cv.convertScaleAbs(frame, alpha=contrast, beta=brightness)
 
-# gaussian blur 
-gaussianTracker = False
-trackBarCreated = False
+def apply_gaussian_blur(frame, frame_name):
+    sigma = cv.getTrackbarPos('Sigma', frame_name)
+    kernel = cv.getTrackbarPos('Kernel', frame_name)
+    if kernel % 2 == 0: kernel += 1
+    return cv.GaussianBlur(frame, (kernel, kernel), sigma)
 
-#bilateral 
-bilateralTracker = False
-bilateralTrackbarCreated = False
+def apply_bilateral_filter(frame, frame_name):
+    d = max(1, cv.getTrackbarPos('Diameter', frame_name))
+    sigmaColor = cv.getTrackbarPos('SigmaColor', frame_name)
+    sigmaSpace = cv.getTrackbarPos('SigmaSpace', frame_name)
+    return cv.bilateralFilter(frame, d, sigmaColor=sigmaColor, sigmaSpace=sigmaSpace)
 
-#translation
-translationTracker = False
-translationBarCreated = False
+def apply_canny(frame):
+    return cv.Canny(frame, 100, 200)
 
+def apply_hough_lines(frame):
+    canny = cv.Canny(frame, 100, 200)
+    edge = cv.cvtColor(canny, cv.COLOR_GRAY2BGR)
+    lines_Hough = cv.HoughLines(canny, 1, np.pi / 180, 150)
+    if lines_Hough is not None:
+        for rho_theta in lines_Hough:
+            rho, theta = rho_theta[0]
+            a, b = math.cos(theta), math.sin(theta)
+            x0, y0 = a*rho, b*rho
+            pt1 = (int(x0 + 1000*(-b)), int(y0 + 1000*(a)))
+            pt2 = (int(x0 - 1000*(-b)), int(y0 - 1000*(a)))
+            cv.line(edge, pt1, pt2, (0,0,255), 3, cv.LINE_AA)
+    return edge
 
-while True:
-    ret, frame = cap.read()
+def apply_translation_rotation_scaling(frame, frame_name):
+    h, w = frame.shape[:2]
+    angle = cv.getTrackbarPos('Angle', frame_name) - 180
+    tx = cv.getTrackbarPos('Translate X', frame_name) - 150
+    ty = cv.getTrackbarPos('Translate Y', frame_name) - 100
+    scale = cv.getTrackbarPos('Scale', frame_name) / 100.0
 
-    if not ret:
-        print("Can't receive frame Strem ending...")
-        break
+    M_rotate = cv.getRotationMatrix2D((w//2, h//2), angle, scale)
+    rotated = cv.warpAffine(frame, M_rotate, (w, h))
+    M_translate = np.float32([[1, 0, tx], [0, 1, ty]])
+    return cv.warpAffine(rotated, M_translate, (w, h))
 
-    if mode == 'g':
-        # gray scale
-        frame_color_scale = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        frame_color_scale = cv.cvtColor(frame_color_scale, cv.COLOR_GRAY2BGR)
-    elif mode == 'h':
-        # hsv scale
-        frame_color_scale = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-        # frame_color_scale = cv.cvtColor(frame_color_scale, cv.COLOR_HSV2BGR)
-    elif mode == 'c':
-        # brightness and contrast
-        if BC_Tracker:
-            brightness = cv.getTrackbarPos('Brightness',frame_name) - 255
-            contrast = cv.getTrackbarPos('Contrast',frame_name) / 10.0
-            # frame_color_scale = cv.addWeighted(frame, contrast, brightness)
-            frame_color_scale = cv.convertScaleAbs(frame, alpha=contrast, beta=brightness)
-            cv.imshow(frame_name, frame_color_scale)
+def apply_histogram(frame):
+    """Return original frame + color histogram side by side."""
+    channels = cv.split(frame)  # B, G, R channels
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # Blue, Green, Red
+
+    # Create histogram canvas
+    hist_img = np.zeros((435, 555, 3), dtype=np.uint8)
+    bin_width = int(round(555 / 256))
+
+    # Loop over each channel
+    for chan, col in zip(channels, colors):
+        hist = cv.calcHist([chan], [0], None, [256], [0, 256])
+        cv.normalize(hist, hist, 0, 400, cv.NORM_MINMAX)
+
+        for i in range(1, 256):
+            cv.line(hist_img,
+                    (bin_width*(i-1), 400 - int(hist[i-1])),
+                    (bin_width*i, 400 - int(hist[i])),
+                    col, 2)
+
+    # Resize frame to match histogram height
+    frame_resized = cv.resize(frame, (555, 435))
+
+    # Stack frame + histogram horizontally
+    combined = np.hstack((frame_resized, hist_img))
+    return combined
+
+# ----------------------- Main Loop -----------------------
+
+def main():
+    cap = cv.VideoCapture(0)
+    if not cap.isOpened():
+        print('Camera cannot be opened.')
+        return
+
+    frame_name = 'Camera Color Scale'
+    cv.namedWindow(frame_name)
+    cv.setMouseCallback(frame_name, click_event)
+
+    mode = 'n'
+
+    ar_handler = AugmentedRealityHandler(
+            calibration_file="calibration_data.npz",
+            model_path="trex_model.obj",   
+            marker_length=0.12,            # trex size in meters
+            model_scale_factor=0.0004,
+            rotate_model=True
+        )
+
+    panorama_handler = PanoramaHandler()
+
+    lines = [
+        '[N] Normal, [G] GrayScale, [H] HSV,',
+        '[C] Contrast/Brightness, [I] Histogram,',
+        '[B] Gaussian Blur, [F] Bilateral Filter',
+        '[E] Canny Edge Detection, [L] Hough Line Detection',
+        '[T] Translation, Rotation, Scaling, [P] for Panorama',
+        '[A] Calibrate Camera, [R] Augumented Reality, ',
+        '[Q] Quit Camera'
+    ]
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Can't receive frame. Stream ending...")
+            break
+
+        # ----------------------- Mode Handling -----------------------
+        if mode == 'g':
+            frame_color_scale = apply_grayscale(frame)
+        elif mode == 'h':
+            frame_color_scale = apply_hsv(frame)
+        elif mode == 'c':
+            frame_color_scale = adjust_brightness_contrast(frame, frame_name)
+        elif mode == 'i':
+            frame_color_scale = apply_histogram(frame)
+        elif mode == 'b':
+            frame_color_scale = apply_gaussian_blur(frame, frame_name)
+        elif mode == 'f':
+            frame_color_scale = apply_bilateral_filter(frame, frame_name)
+        elif mode == 'e':
+            frame_color_scale = apply_canny(frame)
+        elif mode == 'l':
+            frame_color_scale = apply_hough_lines(frame)
+        elif mode == 't':
+            frame_color_scale = apply_translation_rotation_scaling(frame, frame_name)
+        elif mode == 'p':
+            frame_color_scale = panorama_handler.process_frame(frame)
+        elif mode == 'r':
+            frame_color_scale = frame.copy()
+            frame_color_scale = ar_handler.draw_3d_model(frame_color_scale, frame_name)
         else:
             frame_color_scale = frame.copy()
-    elif mode == 'i':
-        # histogram
-        frame_color_scale = frame.copy()
-        hist_img = np.zeros((300, 512, 3), dtype=np.uint8)
-        colors = ('b', 'g', 'r')
-        for i, col in enumerate(colors):
-            hist = cv.calcHist([frame], [i], None, [256], [0, 256])
-            cv.normalize(hist, hist, 0, 300, cv.NORM_MINMAX)
-            for j in range(1, 256):
-                cv.line(hist_img,
-                        (2*(j-1), 300 - int(hist[j-1])),
-                        (2*j, 300 - int(hist[j])),
-                        (255 if col=='b' else 0,
-                         255 if col=='g' else 0,
-                         255 if col=='r' else 0),
-                        2)
-        cv.imshow('Histogram', hist_img)
-    elif mode == 'b':
-        # gaussian blur
-        if gaussianTracker:
-            sigma = cv.getTrackbarPos('Sigma', frame_name)
-            kernel = cv.getTrackbarPos('Kernel', frame_name)
 
-            # kernel size to be odd number
-            if kernel % 2 == 0:
-                kernel += 1
+        # ----------------------- Overlay Text -----------------------
+        for i, line in enumerate(lines):
+            cv.putText(frame_color_scale, line, (33, 316+i*20),
+                       cv.FONT_HERSHEY_COMPLEX, 0.5, (0,255,0), 1, cv.LINE_AA)
 
-            frame_color_scale = cv.GaussianBlur(frame, (kernel,kernel), sigma)
-        else:
-            frame_color_scale = frame.copy()
-    
-    elif mode == 'f':
-        # bilateral Filter
-        if bilateralTracker: 
-            d = cv.getTrackbarPos('Diameter', frame_name)
-            sigmaColor = cv.getTrackbarPos('SigmaColor', frame_name)
-            sigmaSpace = cv.getTrackbarPos('SigmaSpace', frame_name)
-            if d < 1:
-                d = 1
-            frame_color_scale = cv.bilateralFilter(frame, d, sigmaColor=sigmaColor, sigmaSpace=sigmaSpace)
-        else:
-            frame_color_scale = frame.copy()
+        cv.imshow(frame_name, frame_color_scale)
 
-    elif mode == 'e':
-        # Canny Edge Detection
-        frame_color_scale = cv.Canny(frame, 100, 200)
-    
-    elif mode == 'l':
-        # Hough Line Detection
-        canny = cv.Canny(frame, 100, 200)
-        edge = cv.cvtColor(canny, cv.COLOR_GRAY2BGR)
-        copy_edge = np.copy(edge)
+        key = cv.waitKey(1) & 0xFF
 
-        lines_Hough = cv.HoughLines(canny, 1, np.pi / 180, 150, None, 0,0 )
+        if panorama_handler.is_active() and panorama_handler.handle_key(key):
+            continue
 
-        if lines_Hough is not None:
-            for i in range(0, len(lines_Hough)):
-                rho = lines_Hough[i][0][0]
-                theta = lines_Hough[i][0][1]
-                a = math.cos(theta)
-                b = math.sin(theta)
-                x0 = a * rho
-                y0 = b * rho
-                pt1 = (int(x0 + 1000*(-b)), int(y0 + 1000*(a)))
-                pt2 = (int(x0 - 1000*(-b)), int(y0 - 1000*(a)))
-                cv.line(copy_edge, pt1, pt2, (0,0,255), 3, cv.LINE_AA) 
+        if key == ord('q'):
+            break
+        elif key in [ord('n'), ord('g'), ord('h'), ord('c'), ord('i'),
+                     ord('b'), ord('f'), ord('e'), ord('l'), ord('t'), ord('a'), ord('r'), ord('p')]:
+            mode = chr(key)
 
-        frame_color_scale = copy_edge
+            reset_window(frame_name)  # clears old trackbars
+
+            # Recreate trackbars for active mode only
+            if mode == 'c':
+                create_trackbar(frame_name, 'Brightness', 50, 510)
+                create_trackbar(frame_name, 'Contrast', 10, 50)
+            elif mode == 'b':
+                create_trackbar(frame_name, 'Sigma', 1, 20)
+                create_trackbar(frame_name, 'Kernel', 3, 33)
+            elif mode == 'f':
+                create_trackbar(frame_name, 'Diameter', 5, 20)
+                create_trackbar(frame_name, 'SigmaColor', 75, 120)
+                create_trackbar(frame_name, 'SigmaSpace', 75, 120)
+            elif mode == 't':
+                create_trackbar(frame_name, 'Angle', 180, 360)
+                create_trackbar(frame_name, 'Translate X', 150, 300)
+                create_trackbar(frame_name, 'Translate Y', 100, 200)
+                create_trackbar(frame_name, 'Scale', 100, 200)
+            elif mode == 'a':
+                calibrate_camera(cap, frame_name)
+                ar_handler._load_calibration()
+                mode = 'n'
+            elif mode == 'p':
+                panorama_handler.set_active(True)
+
+    cap.release()
+    cv.destroyAllWindows()
 
 
-    elif mode == 't':
-        # Image translation, rotation, and scaling
-        if translationTracker:
-            h, w = frame.shape[:2]
+# ----------------------- Run -----------------------
+if __name__ == "__main__":
+    main()
 
-            # Read trackbar positions
-            angle = cv.getTrackbarPos('Angle', frame_name) - 180  
-            # range -180 to +180
-            tx = cv.getTrackbarPos('Translate X', frame_name) - 150  
-            # range -150 to +150
-            ty = cv.getTrackbarPos('Translate Y', frame_name) - 100  
-            # range -100 to +100
-            scale = cv.getTrackbarPos('Scale', frame_name) / 100.0   
-            # 0.2 – 2.0
 
-            # Rotation + scaling around the center
-            center = (w // 2, h // 2)
-            M_rotate = cv.getRotationMatrix2D(center, angle, scale)
-            rotated = cv.warpAffine(frame, M_rotate, (w, h))
 
-            # Translation
-            M_translate = np.float32([[1, 0, tx], [0, 1, ty]])
-            frame_color_scale = cv.warpAffine(rotated, M_translate, (w, h))
-        else:
-            frame_color_scale = frame.copy()
-
-    else:
-        frame_color_scale = frame
-
-    # Labeling Text
-    x, y0 = 20, 398
-    line_height = 20 
-    for i, line in enumerate(lines):
-        y = y0 + i*line_height
-        cv.putText(frame_color_scale, line, (x, y),
-                cv.FONT_HERSHEY_COMPLEX, 0.5, (255,255,0), 1, cv.LINE_AA)
-
-    cv.imshow(frame_name, frame_color_scale)
-
-    key = cv.waitKey(1) & 0xFF
-    if key == ord('q'):
-        break
-    elif key == ord('g'):
-        mode = 'g'
-    elif key == ord('h'):
-        mode = 'h'
-    elif key == ord('n'):
-        mode = 'n'
-    elif key == ord('c'):
-        mode = 'c'
-        BC_Tracker = not BC_Tracker
-        if BC_Tracker and not trackBarBCCreated:
-            cv.createTrackbar('Brightness', frame_name, 50, 100, nothing)
-            cv.createTrackbar('Contrast', frame_name, 50, 100, nothing)
-            trackBarBCCreated = True
-
-    elif key == ord('i'):
-        mode = 'i'
-    elif key == ord('b'):
-        mode = 'b'
-        gaussianTracker = not gaussianTracker
-        if gaussianTracker and not trackBarCreated:  # create trackbars only once
-            cv.createTrackbar('Sigma', frame_name, 1, 20, nothing)
-            cv.createTrackbar('Kernel', frame_name, 3, 33, nothing)
-            trackBarCreated = True
-
-    elif key == ord('f'):
-        # bilateral
-        mode = 'f'
-        bilateralTracker = not bilateralTracker
-        if bilateralTracker and not bilateralTrackbarCreated:
-            cv.createTrackbar('Diameter', frame_name, 5, 20, nothing)
-            cv.createTrackbar('SigmaColor', frame_name, 75, 120, nothing)
-            cv.createTrackbar('SigmaSpace', frame_name, 75, 120, nothing)
-            bilateralTrackbarCreated = True
-
-    elif key == ord('e'):
-        mode = 'e'
-    elif key == ord('l'):
-        mode = 'l'
-    elif key == ord('t'):
-        mode = 't'
-        translationTracker = not translationTracker
-        if translationTracker and not translationBarCreated:
-            angle_pos = cv.createTrackbar('Angle', frame_name, 180, 250, nothing)
-            tx_pos = cv.createTrackbar('Translate X', frame_name, 5,150,nothing)
-            ty_pos = cv.createTrackbar('Translate Y', frame_name, 5,150,nothing)
-            scale_pos = cv.createTrackbar('Scale' ,frame_name, 25, 75, nothing)
-            translationBarCreated = True
-
-        
-
-cap.release()
-cv.destroyAllWindows()
 
